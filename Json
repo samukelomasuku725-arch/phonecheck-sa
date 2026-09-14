@@ -1,18 +1,354 @@
-// package.json
-{
-  "name": "deviceguard",
-  "version": "1.0.0",
-  "private": true,
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^5.1.0",
-    "better-sqlite3": "^12.4.1",
-    "jsonwebtoken": "^9.0.2"
-  }
-}
+from flask import Flask, request, jsonify
+import sqlite3
+import hashlib
+import os
+from datetime import datetime, timezone
+
+app = Flask(__name__)
+
+DATABASE = "deviceguard.db"
+
+
+def get_db():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def hash_device_id(device_id):
+    return hashlib.sha256(
+        device_id.encode("utf-8")
+    ).hexdigest()
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def init_database():
+    conn = get_db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT UNIQUE NOT NULL,
+            imei TEXT,
+            serial_number TEXT,
+            owner_id TEXT,
+            status TEXT DEFAULT 'active',
+            risk_score INTEGER DEFAULT 0,
+            tamper_detected INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS security_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            severity TEXT DEFAULT 'info',
+            details TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+@app.route("/")
+def home():
+    return jsonify({
+        "name": "DeviceGuard",
+        "version": "1.0.0",
+        "status": "online"
+    })
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "healthy",
+        "service": "DeviceGuard API"
+    })
+
+
+@app.route("/api/devices/register", methods=["POST"])
+def register_device():
+
+    data = request.get_json(silent=True) or {}
+
+    device_id = data.get("device_id")
+
+    if not device_id:
+        return jsonify({
+            "success": False,
+            "error": "device_id is required"
+        }), 400
+
+    hashed_id = hash_device_id(device_id)
+
+    conn = get_db()
+
+    existing = conn.execute(
+        "SELECT id FROM devices WHERE device_id = ?",
+        (hashed_id,)
+    ).fetchone()
+
+    if existing:
+        conn.close()
+
+        return jsonify({
+            "success": False,
+            "error": "Device already enrolled"
+        }), 409
+
+    timestamp = now()
+
+    conn.execute("""
+        INSERT INTO devices (
+            device_id,
+            imei,
+            serial_number,
+            owner_id,
+            status,
+            risk_score,
+            tamper_detected,
+            created_at,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        hashed_id,
+        data.get("imei"),
+        data.get("serial_number"),
+        data.get("owner_id"),
+        "active",
+        0,
+        0,
+        timestamp,
+        timestamp
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "message": "Device successfully enrolled"
+    }), 201
+
+
+@app.route("/api/devices/<device_id>", methods=["GET"])
+def get_device(device_id):
+
+    hashed_id = hash_device_id(device_id)
+
+    conn = get_db()
+
+    device = conn.execute("""
+        SELECT
+            status,
+            risk_score,
+            tamper_detected,
+            created_at,
+            updated_at
+        FROM devices
+        WHERE device_id = ?
+    """, (hashed_id,)).fetchone()
+
+    conn.close()
+
+    if not device:
+        return jsonify({
+            "error": "Device not found"
+        }), 404
+
+    return jsonify({
+        "status": device["status"],
+        "risk_score": device["risk_score"],
+        "tamper_detected": bool(device["tamper_detected"]),
+        "created_at": device["created_at"],
+        "updated_at": device["updated_at"]
+    })
+
+
+@app.route("/api/devices/<device_id>/policy", methods=["GET"])
+def device_policy(device_id):
+
+    hashed_id = hash_device_id(device_id)
+
+    conn = get_db()
+
+    device = conn.execute("""
+        SELECT
+            status,
+            risk_score,
+            tamper_detected
+        FROM devices
+        WHERE device_id = ?
+    """, (hashed_id,)).fetchone()
+
+    conn.close()
+
+    if not device:
+        return jsonify({
+            "error": "Device not found"
+        }), 404
+
+    risk = device["risk_score"]
+
+    return jsonify({
+        "status": device["status"],
+        "risk_score": risk,
+        "tamper_detected": bool(device["tamper_detected"]),
+        "policy": {
+            "allow_device": device["status"] == "active",
+            "security_review_required": risk >= 50,
+            "security_alert": bool(device["tamper_detected"])
+        }
+    })
+
+
+@app.route("/api/devices/<device_id>/events", methods=["POST"])
+def security_event(device_id):
+
+    data = request.get_json(silent=True) or {}
+
+    event_type = data.get("event_type")
+    severity = data.get("severity", "info")
+    details = data.get("details", {})
+
+    allowed_events = [
+        "root_detected",
+        "bootloader_status_changed",
+        "integrity_failure",
+        "debugging_detected",
+        "suspicious_reset",
+        "device_rebooted",
+        "security_check_passed"
+    ]
+
+    if event_type not in allowed_events:
+        return jsonify({
+            "error": "Unsupported security event"
+        }), 400
+
+    hashed_id = hash_device_id(device_id)
+
+    conn = get_db()
+
+    device = conn.execute(
+        "SELECT id FROM devices WHERE device_id = ?",
+        (hashed_id,)
+    ).fetchone()
+
+    if not device:
+        conn.close()
+
+        return jsonify({
+            "error": "Device not enrolled"
+        }), 404
+
+    conn.execute("""
+        INSERT INTO security_events (
+            device_id,
+            event_type,
+            severity,
+            details,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        hashed_id,
+        event_type,
+        severity,
+        str(details),
+        now()
+    ))
+
+    dangerous_events = [
+        "root_detected",
+        "integrity_failure",
+        "suspicious_reset"
+    ]
+
+    if event_type in dangerous_events:
+
+        conn.execute("""
+            UPDATE devices
+            SET
+                risk_score = MIN(risk_score + 20, 100),
+                tamper_detected = 1,
+                updated_at = ?
+            WHERE device_id = ?
+        """, (
+            now(),
+            hashed_id
+        ))
+
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "success": True,
+        "message": "Security event recorded"
+    }), 201
+
+
+@app.route("/api/dashboard/summary", methods=["GET"])
+def dashboard_summary():
+
+    conn = get_db()
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM devices"
+    ).fetchone()[0]
+
+    active = conn.execute(
+        "SELECT COUNT(*) FROM devices WHERE status = 'active'"
+    ).fetchone()[0]
+
+    overdue = conn.execute(
+        "SELECT COUNT(*) FROM devices WHERE status = 'overdue'"
+    ).fetchone()[0]
+
+    stolen = conn.execute(
+        "SELECT COUNT(*) FROM devices WHERE status = 'stolen'"
+    ).fetchone()[0]
+
+    fraud = conn.execute(
+        "SELECT COUNT(*) FROM devices WHERE status = 'fraud'"
+    ).fetchone()[0]
+
+    blocked = conn.execute(
+        "SELECT COUNT(*) FROM devices WHERE status = 'blocked'"
+    ).fetchone()[0]
+
+    tampered = conn.execute(
+        "SELECT COUNT(*) FROM devices WHERE tamper_detected = 1"
+    ).fetchone()[0]
+
+    conn.close()
+
+    return jsonify({
+        "total_devices": total,
+        "active_devices": active,
+        "overdue_devices": overdue,
+        "stolen_devices": stolen,
+        "fraud_devices": fraud,
+        "blocked_devices": blocked,
+        "tampered_devices": tampered
+    })
+
+
+init_database()
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000))
+    )
